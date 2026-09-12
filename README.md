@@ -4,18 +4,50 @@ A control plane for a GPU inference fleet: a **versioned host lifecycle state ma
 **durable Temporal provisioning workflow**, and a **bin-packer that measures and repairs
 fragmentation** — the capacity you own but cannot schedule.
 
-**35 tests, `go vet` clean.** Coverage: `fleet` 95.3%, `scheduler` 91.4%.
-The Temporal workflows are tested against the SDK's replay environment, so no server is needed
-to run the suite.
+**56 tests, `go vet` clean, no cluster required to run them.** The reconciler is tested against
+controller-runtime's fake client and the Temporal workflows against the SDK's replay environment,
+so `go test ./...` needs no API server, no etcd, no envtest binaries.
 
 ```
 go test ./... -cover
+ok  .../internal/controller  coverage: 78.4% of statements
 ok  .../internal/fleet       coverage: 95.3% of statements
-ok  .../internal/scheduler   coverage: 91.4% of statements
+ok  .../internal/scheduler   coverage: 91.2% of statements
 ok  .../internal/workflow    coverage: 49.1% of statements
 ```
 
 ---
+
+## The declarative surface
+
+```yaml
+apiVersion: fleet.gpu.io/v1alpha1
+kind: InferenceCluster
+spec:
+  model: llama-3.3-70b
+  gpuType: h100
+  replicas: 4
+  gpusPerReplica: 8
+  requireSameDomain: true    # keep the replicas on one NVLink island
+```
+
+Nothing in that spec names a node, a scheduler or a serving runtime. That is the decoupling: the
+caller says what they need, the controller decides what satisfies it.
+
+```
+$ kubectl get ic
+NAME       MODEL           GPU    WANT  READY  PHASE      FRAG   AGE
+chat-70b   llama-3.3-70b   h100   4     4      Ready      0.00   6d
+embed-sm   bge-large       h100   8     5      Degraded   1.00   2h
+```
+
+`embed-sm` is the interesting row. It is short three replicas and `FRAG 1.00` says why: there is
+free capacity, and none of it is in a usable shape. The condition spells it out rather than leaving
+an operator to guess.
+
+```
+Capacity  False  Fragmented  widest placeable replica is 2 GPUs, request is 8; fragmentation 1.00
+```
 
 ## The problem this is about
 
@@ -93,7 +125,7 @@ retry policy that cannot tell the difference between a broken host and a broken 
 
 ---
 
-## Two bugs the tests caught
+## Three bugs the tests caught
 
 Worth recording, because they are the reason the suite exists.
 
@@ -109,14 +141,25 @@ nowhere else. Every retry after the first died on `ErrIllegalTransition`. The st
 what a pile of if-statements would have silently allowed. Now the loop picks `Provision` or `Retry`
 based on the phase it is actually in, in one place.
 
+**The reconciler double-booked every node.** Before placing, it replays what every *other* cluster
+already holds, skipping itself — and it identified "itself" by comparing `UID`. `UID` is assigned by
+the API server and is empty on an object that has not been through it, so the comparison matched
+every cluster against every other, every sibling was skipped, and each cluster saw a completely empty
+fleet. Two clusters would each place 8 GPUs on the same 8-GPU node and both report `Ready`. Now it
+compares namespace and name. `TestOtherClustersCapacityIsRespected` is the regression test.
+
 ---
 
 ## Layout
 
 ```
-internal/scheduler/   bin-packing, fragmentation metric, defragmentation planner   (no deps)
-internal/fleet/       host lifecycle state machine, versioned transition table     (no deps)
+api/v1alpha1/         InferenceCluster CRD types + hand-written deepcopy
+internal/controller/  the reconciler: converge placement, report capacity truthfully
+internal/scheduler/   bin-packing, fragmentation, defragmentation, topology         (no deps)
+internal/fleet/       host lifecycle state machine, versioned transition table      (no deps)
 internal/workflow/    Temporal provisioning + drain workflows, activity interface
+cmd/manager/          manager entrypoint (leader election, health probes, metrics)
+config/crd/           the CRD manifest
 ```
 
 `scheduler` and `fleet` depend on nothing outside the standard library — the packing and the rules
@@ -129,13 +172,16 @@ workflow learning about it — the decoupling a platform exists to provide.
 
 ## Not done yet
 
-- **No Kubernetes controller.** The CRD and reconciler are the obvious next layer: the state machine
-  and the packer are the hard parts and they are done, but `InferenceCluster` as a CRD with a
-  controller-runtime reconcile loop is not written.
-- `workflow` coverage is 49% — the happy path, retry exhaustion, transient recovery, abort and drain
-  are covered; the decommission branches are not.
-- Topology is modelled as a `Domain` string on each node but the packer does not yet prefer
-  same-domain placement for multi-GPU workloads. NVLink islands deserve real treatment.
+- **The controller places, it does not yet serve.** Reconciliation decides which node each replica
+  belongs on and records it in status; creating the actual serving pods and wiring them to the
+  runtime is the next layer down.
+- **Deepcopy is hand-written**, not generated. It matches what controller-gen emits, but the repo has
+  no code-generation step, so a new field means remembering to update `zz_deepcopy.go`.
+- `workflow` coverage is 49% — happy path, retry exhaustion, transient recovery, abort and drain are
+  covered; the decommission branches are not.
+- **The defragmenter is not wired into the controller.** `Defragment` computes and applies plans, but
+  nothing calls it on a schedule or on a fragmentation threshold. That is deliberate: automatically
+  migrating live replicas needs a policy and a maintenance window, not a cron.
 - No real `Provisioner` implementation — the interface is there, PXE/Redfish/IPMI behind it is not.
 
 ## Licence

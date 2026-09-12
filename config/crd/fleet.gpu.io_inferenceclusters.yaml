@@ -1,0 +1,150 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: inferenceclusters.fleet.gpu.io
+spec:
+  group: fleet.gpu.io
+  names:
+    kind: InferenceCluster
+    listKind: InferenceClusterList
+    plural: inferenceclusters
+    singular: inferencecluster
+    shortNames:
+      - ic
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Model
+          type: string
+          jsonPath: .spec.model
+        - name: GPU
+          type: string
+          jsonPath: .spec.gpuType
+        - name: Want
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Frag
+          type: string
+          jsonPath: .status.fragmentation
+          description: share of free GPUs too scattered to take a replica this wide
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: |
+            InferenceCluster is one declared serving deployment. The caller says
+            what they need; the controller decides which hardware pool, node and
+            interconnect domain satisfies it.
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: [model, gpuType, replicas, gpusPerReplica]
+              properties:
+                model:
+                  type: string
+                  minLength: 1
+                  description: the model to serve
+                gpuType:
+                  type: string
+                  minLength: 1
+                  description: hardware pool; a replica is never placed off-pool
+                replicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                gpusPerReplica:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  description: GPUs one replica needs on a single node
+                requireSameDomain:
+                  type: boolean
+                  description: |
+                    keep every replica inside one interconnect domain. If no
+                    single domain can hold them, the controller places what it
+                    can and reports Topology=False rather than spreading quietly.
+                runtime:
+                  type: string
+                  description: optionally pin the serving stack; normally left empty
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Provisioning, Ready, Degraded, Draining, Failed]
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  description: |
+                    the .metadata.generation this status was computed from. If it
+                    trails, the spec changed and this status describes the old one.
+                readyReplicas:
+                  type: integer
+                  format: int32
+                fragmentation:
+                  type: string
+                  description: |
+                    share of free GPUs in this pool that cannot accept a replica
+                    of the requested width. 1.00 means there is free capacity and
+                    none of it is usable at this size.
+                largestPlaceable:
+                  type: integer
+                  format: int32
+                placements:
+                  type: array
+                  items:
+                    type: object
+                    required: [replica, node, gpus]
+                    properties:
+                      replica:
+                        type: integer
+                        format: int32
+                      node:
+                        type: string
+                      domain:
+                        type: string
+                      gpus:
+                        type: integer
+                        format: int32
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status, reason, lastTransitionTime]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      observedGeneration:
+                        type: integer
+                        format: int64
